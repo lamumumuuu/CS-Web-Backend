@@ -1,0 +1,66 @@
+"""arq worker 进程入口。
+
+启动（独立于 web 进程）：
+    arq app.core.queue.worker.WorkerSettings
+
+仅在启动 worker 时才会被 import（此时 arq 必装、REDIS_URL 必配）；web 进程不 import 本模块。
+"""
+
+from arq.connections import RedisSettings
+from arq.cron import cron
+
+from app.core.config import settings
+from app.core.loguru_logger import get_logger
+from app.core.queue.tasks import TASKS
+from app.services.maintenance_cron import (
+    data_retention_cron,
+    exception_retention_cron,
+    legacy_user_reconcile_cron,
+    token_gc_cron,
+)
+
+logger = get_logger("queue.worker")
+
+if not settings.REDIS_URL:
+    # worker 必须有 broker。web 进程不会走到这里（它只 import client，不 import worker）。
+    raise RuntimeError(
+        "启动 arq worker 需要配置 REDIS_URL（broker）；请在环境中配置后再启动 worker。"
+    )
+
+_BROKER_URL = settings.REDIS_URL
+assert _BROKER_URL is not None
+
+
+async def on_startup(ctx) -> None:
+    # 每个 worker 实例注册本地通知订阅者；配合事件总线跨实例广播（ADR-014），
+    # 收到广播后在自身进程内运行订阅者，实现多实例事件一致。
+    from app.services.legacy_user_sync import register_legacy_sync_events
+    from app.services.notification_events import register_notification_events
+
+    register_notification_events()
+    register_legacy_sync_events()
+    logger.info("arq worker 启动", tasks=[fn.__name__ for fn in TASKS])
+
+
+async def on_shutdown(ctx) -> None:
+    logger.info("arq worker 关闭")
+
+
+class WorkerSettings:
+    """arq 读取此类来配置 worker。新增任务只需登记到 tasks.TASKS。"""
+
+    functions = TASKS
+    cron_jobs = [
+        cron(token_gc_cron, minute=0),  # 每小时整点：过期 refresh token 清理
+        cron(
+            data_retention_cron, hour=3, minute=0
+        ),  # 每日 03:00：登录历史 / 审计日志保留期
+        cron(exception_retention_cron, hour=3, minute=30),  # 每日 03:30：异常日志保留期
+        # 每 6 小时（00/06/12/18 整点）：旧项目用户增量对账（outbox 重放 + 变更拉取）
+        cron(legacy_user_reconcile_cron, hour={0, 6, 12, 18}, minute=0),
+    ]
+    redis_settings = RedisSettings.from_dsn(_BROKER_URL)
+    on_startup = on_startup
+    on_shutdown = on_shutdown
+    max_tries = 3  # 失败任务自动重试次数（邮件发送等瞬时故障可自动恢复）
+    job_timeout = 60  # 单任务超时（秒），防止 SMTP 挂起阻塞 worker

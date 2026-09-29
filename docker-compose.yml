@@ -1,0 +1,145 @@
+# ============ CS-Web-Backend 一键部署 ============
+# 使用：
+#   1. cp .env.docker.example .env 并填写全部 CHANGE_ME 变量
+#   2. docker compose up -d --build
+#   3. 访问 http://<host>:9000/docs
+#
+# 说明：
+#   - PostgreSQL（含 zhparser 中文分词）数据持久化在 pgdata 卷
+#   - 迁移与发布分离：独立 migrate 服务执行 alembic upgrade head（DB_AUTO_MIGRATE=false）
+#   - 后端监听容器内 8000，映射宿主 9000（与前端 BFF 默认一致）
+#   - 前端容器通过 cs-net 网络直连 backend:8000（无需暴露公网）
+#   - backup sidecar 每日 03:00 自动全量备份，保留 14 天
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: docker/db/Dockerfile
+    container_name: cs-backend-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME:-domefff}
+      POSTGRES_USER: ${DATABASE_USER:-postgres}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:?请在 .env 中设置 DATABASE_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-postgres} -d ${DATABASE_NAME:-domefff}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks:
+      - cs-net
+
+  backend:
+    build: .
+    container_name: cs-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 容器内连 db 服务，覆盖 .env 中的 localhost
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:-domefff}
+      DATABASE_USER: ${DATABASE_USER:-postgres}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+      # 空库自动建库；迁移由独立 migrate 服务执行（ER-30，DB_AUTO_MIGRATE=false）
+      DB_AUTO_CREATE_DATABASE: "true"
+      DB_AUTO_MIGRATE: "false"
+      SECRET_KEY: ${SECRET_KEY}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
+      PASSWORD_RESET_DEFAULT: ${PASSWORD_RESET_DEFAULT:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      REQUIRE_REDIS_FOR_SECURITY: "false"
+      # 全文检索配置：chinese（需 zhparser，已内置于 db 镜像）
+      FTS_CONFIG: ${FTS_CONFIG:-chinese}
+      # 可观测性：启用 OTel 时指向 collector（--profile observability 启动）
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-cs-web-backend}
+    ports:
+      - "9000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - cs-net
+
+  # ============ 数据库迁移（ER-30：独立 migrate job）============
+  # 一次性任务：等 db 健康后执行 alembic upgrade head，完成后退出；
+  # backend 经 depends_on 等待其成功，避免版本不一致导致启动失败。
+  migrate:
+    build: .
+    container_name: cs-backend-migrate
+    restart: "no"
+    env_file: .env
+    environment:
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:-domefff}
+      DATABASE_USER: ${DATABASE_USER:-postgres}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+      SECRET_KEY: ${SECRET_KEY:?请在 .env 中设置 SECRET_KEY}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY:?请在 .env 中设置 TOTP_ENCRYPTION_KEY}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - cs-net
+
+  # 数据库备份 sidecar：每日 03:00 全量备份，保留 14 天
+  backup:
+    image: postgres:16-alpine
+    container_name: cs-backend-backup
+    restart: unless-stopped
+    environment:
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:-domefff}
+      DATABASE_USER: ${DATABASE_USER:-postgres}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ./tools/scripts/db/backup_db.sh:/usr/local/bin/backup_db.sh:ro
+      - backups:/backups
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        chmod +x /usr/local/bin/backup_db.sh
+        echo "0 3 * * * /usr/local/bin/backup_db.sh /backups >> /var/log/backup.log 2>&1" > /etc/crontabs/root
+        echo "[backup] cron 已启动，每日 03:00 执行备份"
+        crond -f -l 2
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - cs-net
+
+  # 可观测性 collector（可选，--profile observability 启动）
+  # docker compose --profile observability up -d
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    container_name: cs-otel-collector
+    restart: unless-stopped
+    profiles: ["observability"]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./tools/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"  # OTLP gRPC
+      - "4318:4318"  # OTLP HTTP
+    networks:
+      - cs-net
+
+volumes:
+  pgdata:
+  backups:
+
+networks:
+  cs-net:
+    driver: bridge

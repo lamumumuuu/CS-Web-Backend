@@ -1,0 +1,487 @@
+"""工具集模块 schema：考试 / 资源 / 任务 / 积分 / Auxilio / 组件注册表。"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from app.schemas.base import TZModel, camel_config
+
+# ------------------------------------------------------------------ 考试
+
+EXAM_LIMITS = {
+    "TITLE_MAX": 100,
+    "DESC_MAX": 1000,
+    "TAGS_MAX": 10,
+    "TAG_MAX": 30,
+}
+
+
+class ExamInput(BaseModel):
+    title: str
+    description: Optional[str] = None
+    status: str = "draft"
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    duration_minutes: Optional[int] = None
+    tech_tags: Optional[List[str]] = None
+    questions: Optional[List["QuestionInput"]] = None
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("标题不能为空")
+        if len(v) > EXAM_LIMITS["TITLE_MAX"]:
+            raise ValueError(f"标题不能超过 {EXAM_LIMITS['TITLE_MAX']} 字符")
+        return v
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str) -> str:
+        if v not in {"draft", "published", "ended"}:
+            raise ValueError("状态必须为 draft / published / ended")
+        return v
+
+
+class QuestionInput(BaseModel):
+    type: str = "single_choice"
+    title: str
+    content_markdown: Optional[str] = None
+    score: int = 5
+    sort_order: int = 0
+    options: Optional[List[Dict[str, Any]]] = None  # [{label, content, is_correct}]
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    @field_validator("type")
+    @classmethod
+    def _validate_type(cls, v: str) -> str:
+        if v not in {"single_choice", "multiple_choice", "programming"}:
+            raise ValueError("题目类型无效")
+        return v
+
+
+class ExamAttemptInput(BaseModel):
+    question_id: int
+    answer: str
+
+
+class ExamSubmitIn(BaseModel):
+    answers: List[ExamAttemptInput]
+
+
+class ExamOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    description: Optional[str] = None
+    status: str
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    duration_minutes: Optional[int] = None
+    tech_tags: Optional[List[str]] = None
+    created_by: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class QuestionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    exam_id: int
+    type: str
+    title: str
+    content_markdown: Optional[str] = None
+    score: int
+    sort_order: int
+    options: List[Dict[str, Any]] = []
+    created_at: datetime
+
+
+class AttemptOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    exam_id: int
+    question_id: int
+    answer: Optional[str] = None
+    is_correct: Optional[bool] = None
+    score: Optional[int] = None
+    submitted_at: datetime
+
+
+class RankingEntry(BaseModel):
+    user_id: int
+    display_name: Optional[str] = None
+    total_score: int
+    total_questions: int
+    correct_count: int
+    submitted_at: Optional[datetime] = None
+
+
+# ------------------------------------------------------------------ 资源
+
+RESOURCE_TYPES = {"article", "video", "course", "book", "tool", "other"}
+
+
+class ResourceInput(BaseModel):
+    title: str
+    url: str
+    description: Optional[str] = None
+    resource_type: str = "article"
+    tech_tags: Optional[List[str]] = None
+    file_url: Optional[str] = None
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("标题不能为空")
+        return v
+
+    @field_validator("resource_type")
+    @classmethod
+    def _validate_type(cls, v: str) -> str:
+        if v not in RESOURCE_TYPES:
+            raise ValueError("资源类型无效")
+        return v
+
+
+class ResourceOut(TZModel):
+    id: int
+    title: str
+    url: str
+    description: Optional[str] = None
+    resource_type: str
+    tech_tags: List[str] = []
+    status: str
+    submitted_by: int
+    submitted_by_name: Optional[str] = None
+    reviewed_by: Optional[int] = None
+    review_note: Optional[str] = None
+    file_url: Optional[str] = None
+    view_count: int
+    like_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+# ------------------------------------------------------------------ 任务
+
+
+class TaskInput(BaseModel):
+    title: str
+    description: str
+    content_markdown: Optional[str] = None
+    category: str = "general"
+    tags: Optional[List[str]] = None
+    points: int = 10
+    max_claimants: int = 1
+    status: str = "draft"
+    # ---- 外接旧项目任务字段（阶段 3 起前端直接提交；旧字段作等价兜底）----
+    difficulty: Optional[str] = None
+    reward: Optional[int] = None
+    deadline: Optional[datetime] = None
+    tech_requirements: Optional[List[str]] = None
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("标题不能为空")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _validate_description(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("描述不能为空")
+        return v
+
+    @field_validator("points")
+    @classmethod
+    def _validate_points(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("积分不能为负数")
+        return v
+
+    @field_validator("max_claimants")
+    @classmethod
+    def _validate_max_claimants(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("认领人数至少为 1")
+        return v
+
+
+class TaskSubmitIn(BaseModel):
+    """提交成果入参：兼容前端既有字段名（submission_url / note）与旧项目契约名。"""
+
+    description: Optional[str] = None
+    attachment_url: Optional[str] = None
+    note: Optional[str] = None
+    submission_url: Optional[str] = None
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    @property
+    def effective_description(self) -> Optional[str]:
+        return self.description if self.description is not None else self.note
+
+    @property
+    def effective_attachment(self) -> Optional[str]:
+        return (
+            self.attachment_url
+            if self.attachment_url is not None
+            else self.submission_url
+        )
+
+
+class TaskActionIn(BaseModel):
+    """管理端任务动作入参（驳回 / 强制结项的原因，可选）。"""
+
+    reason: Optional[str] = None
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class TaskOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    description: str
+    content_markdown: Optional[str] = None
+    category: str
+    tags: Optional[List[str]] = None
+    points: int
+    max_claimants: int
+    status: str
+    created_by: int
+    published_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+    # ---- 外接旧项目任务的对外字段（本地端点不产出，代理端点产出）----
+    difficulty: Optional[str] = None
+    reward: Optional[int] = None
+    deadline: Optional[datetime] = None
+    tech_requirements: Optional[List[str]] = None
+    status_label: Optional[str] = None
+    publisher_id: Optional[str] = None
+    publisher_name: Optional[str] = None
+    publisher_avatar: Optional[str] = None
+    completer: Optional[Dict[str, Any]] = None
+    submission_description: Optional[str] = None
+    attachment_url: Optional[str] = None
+    reject_reason: Optional[str] = None
+    reviewed_by: Optional[int] = None
+    reviewed_at: Optional[datetime] = None
+
+
+class TaskClaimOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    task_id: int
+    user_id: int
+    display_name: Optional[str] = None
+    status: str
+    claim_note: Optional[str] = None
+    completed_at: Optional[datetime] = None
+    reviewed_by: Optional[int] = None
+    review_note: Optional[str] = None
+    created_at: datetime
+
+
+# ------------------------------------------------------------------ 积分
+
+
+class PointsTransactionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    amount: int
+    reason: str
+    source_type: str
+    source_id: Optional[int] = None
+    balance_after: int
+    created_at: datetime
+
+
+class PointsProfileOut(BaseModel):
+    balance: int
+    level: int
+    level_title: str
+    transactions: List[PointsTransactionOut] = []
+
+
+class LeaderboardEntry(BaseModel):
+    user_id: int
+    display_name: Optional[str] = None
+    balance: int
+    level: int
+    level_title: str
+
+
+# ------------------------------------------------------------------ Auxilio
+
+
+class WeaknessTag(BaseModel):
+    tag: str
+    total: int
+    correct: int
+    accuracy: float
+
+
+class RecommendedResource(BaseModel):
+    id: int
+    title: str
+    url: str
+    description: Optional[str] = None
+    resource_type: str
+    tech_tags: List[str] = []
+
+
+class AuxilioAnalysis(BaseModel):
+    weak_tags: List[WeaknessTag] = []
+    recommended_resources: List[RecommendedResource] = []
+
+
+# ------------------------------------------------------------------ 组件注册表
+
+
+class ComponentItemInput(BaseModel):
+    name: str
+    slug: str
+    category: str = "general"
+    description: Optional[str] = None
+    sort_order: int = 0
+    migration_status: str = "legacy"
+    # camel_config 让前端用 camelCase（migrationStatus/sortOrder）提交，
+    # populate_by_name 同时兼容旧客户端用 snake_case 提交。
+    model_config = camel_config(str_strip_whitespace=True)
+
+    @field_validator("name", "slug")
+    @classmethod
+    def _validate_required(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("名称/slug 不能为空")
+        return v
+
+
+class ComponentVariantInput(BaseModel):
+    size: str
+    color: str
+    state: str
+    is_enabled: bool = True
+    model_config = camel_config(str_strip_whitespace=True)
+
+
+class ComponentVariantToggleInput(BaseModel):
+    """变体开关输入：PATCH 单个变体的启用状态。"""
+
+    variant_id: int
+    enabled: bool
+    model_config = camel_config(str_strip_whitespace=True)
+
+
+# 迁移状态合法值（与前端 STATUS_CONFIG 顺序保持一致）。
+COMPONENT_MIGRATION_STATUSES = {"legacy", "in-progress", "migrated", "deprecated"}
+
+# 变体矩阵预设合法值（与前端 VARIANT_PRESETS 保持一致）。
+COMPONENT_VARIANT_PRESETS = {"all", "none", "primary", "minimal"}
+
+
+class ComponentMigrationStatusInput(BaseModel):
+    """迁移状态更新输入：PATCH 单个 item 的 migrationStatus。"""
+
+    migration_status: str
+    model_config = camel_config(str_strip_whitespace=True)
+
+    @field_validator("migration_status")
+    @classmethod
+    def _validate_status(cls, v: str) -> str:
+        if v not in COMPONENT_MIGRATION_STATUSES:
+            raise ValueError("迁移状态无效")
+        return v
+
+
+class ComponentGuideInput(BaseModel):
+    use_cases: List[str] = []
+    anti_patterns: List[str] = []
+    model_config = camel_config(str_strip_whitespace=True)
+
+
+class ComponentVariantPresetInput(BaseModel):
+    """变体矩阵预设输入：POST 应用一个预设批量翻转 is_enabled。"""
+
+    preset: str
+    model_config = camel_config(str_strip_whitespace=True)
+
+    @field_validator("preset")
+    @classmethod
+    def _validate_preset(cls, v: str) -> str:
+        if v not in COMPONENT_VARIANT_PRESETS:
+            raise ValueError("变体预设无效")
+        return v
+
+
+class ComponentVariantOut(BaseModel):
+    model_config = camel_config(from_attributes=True)
+
+    id: int
+    size: str
+    color: str
+    state: str
+    is_enabled: bool
+
+
+class ComponentGuideOut(BaseModel):
+    model_config = camel_config(from_attributes=True)
+
+    id: int
+    use_cases: List[str] = []
+    anti_patterns: List[str] = []
+
+
+class ComponentItemOut(BaseModel):
+    # camel_config 输出 camelCase，与前端的 ComponentItem 字段对齐，
+    # 修复此前 snake_case（migration_status/sort_order/is_enabled...）
+    # 导致前端 item.migrationStatus 为 undefined 而崩溃的问题。
+    model_config = camel_config(from_attributes=True)
+
+    id: int
+    name: str
+    slug: str
+    category: str
+    description: Optional[str] = None
+    migration_status: str
+    sort_order: int
+    # 可见性闭环：slug 对应可见性模块当前是否全开（None 表示未接入可见性服务）。
+    visibility_open: Optional[bool] = None
+    variants: List[ComponentVariantOut] = []
+    guide: Optional[ComponentGuideOut] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ComponentMigrationStatusOutput(BaseModel):
+    """迁移状态更新结果：携带旧状态与可见性联动结果，供治理事件审计。"""
+
+    name: str
+    old_migration_status: str
+    migration_status: str
+    visibility_opened: bool = False
+    model_config = camel_config()

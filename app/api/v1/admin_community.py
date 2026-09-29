@@ -1,0 +1,307 @@
+"""社区 v2 管理 API：审核（posts/comments）+ 分类 + 举报处理 + 社区管理。"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, Request
+
+from app.dependencies_services import (
+    get_category_service,
+    get_comment_service,
+    get_post_service,
+    get_report_service,
+)
+from app.middleware.rbac import require_admin_2fa, require_permission
+from app.models.user import User
+from app.schemas.community import post_to_dict
+from app.schemas.pagination import PaginatedResponse, PaginationParams
+from app.services.community.community_category import CategoryService
+from app.services.community.community_comment import CommentService
+from app.services.community.community_post import PostService
+from app.services.community.community_report import ReportService
+
+router = APIRouter(dependencies=[Depends(require_admin_2fa())])
+
+
+# ------------------------------------------------------------------ 内容审核
+
+
+@router.get("/topics")
+async def admin_list_posts(
+    kind: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    sort: str = "latest",
+    pagination: PaginationParams = Depends(),
+    service: PostService = Depends(get_post_service),
+    current_user: User = Depends(require_permission("community", "read")),
+) -> Any:
+    """内容列表（管理视图：published + hidden，排除 deleted）。"""
+    posts, total = await service.list_posts(
+        kind=kind,
+        status=status,
+        search=search,
+        sort=sort,
+        include_hidden=True,
+        skip=pagination.skip,
+        limit=pagination.limit,
+    )
+    return PaginatedResponse(
+        items=[post_to_dict(p) for p in posts],
+        total=total,
+        skip=pagination.skip,
+        limit=pagination.limit,
+    )
+
+
+@router.put("/topics/{post_id}")
+async def admin_update_post(
+    post_id: int,
+    body: dict,
+    service: PostService = Depends(get_post_service),
+    current_user: User = Depends(require_permission("community", "update")),
+) -> Any:
+    post = await service.update_post(current_user.id, post_id, body, is_admin=True)
+    return post_to_dict(post)
+
+
+@router.delete("/topics/{post_id}")
+async def admin_hard_delete_post(
+    post_id: int,
+    service: PostService = Depends(get_post_service),
+    current_user: User = Depends(require_permission("community", "delete")),
+) -> Any:
+    await service.hard_delete_post(current_user.id, post_id)
+    return {"ok": True}
+
+
+@router.post("/topics/{post_id}/hide")
+async def hide_post(
+    post_id: int,
+    body: Optional[dict] = None,
+    service: PostService = Depends(get_post_service),
+    current_user: User = Depends(require_permission("community", "hide")),
+) -> Any:
+    reason = (body or {}).get("reason")
+    await service.hide_post(current_user.id, post_id, reason)
+    return {"ok": True}
+
+
+@router.post("/topics/{post_id}/restore")
+async def restore_post(
+    post_id: int,
+    service: PostService = Depends(get_post_service),
+    current_user: User = Depends(require_permission("community", "restore")),
+) -> Any:
+    await service.restore_post(current_user.id, post_id)
+    return {"ok": True}
+
+
+@router.post("/topics/{post_id}/pin")
+async def pin_post(
+    post_id: int,
+    service: PostService = Depends(get_post_service),
+    current_user: User = Depends(require_permission("community", "pin")),
+) -> Any:
+    post = await service.get_post(post_id)
+    await service.set_post_pinned(current_user.id, post_id, not post.is_pinned)
+    return {"ok": True}
+
+
+@router.post("/topics/{post_id}/feature")
+async def feature_post(
+    post_id: int,
+    service: PostService = Depends(get_post_service),
+    current_user: User = Depends(require_permission("community", "feature")),
+) -> Any:
+    post = await service.get_post(post_id)
+    await service.set_post_featured(current_user.id, post_id, not post.is_featured)
+    return {"ok": True}
+
+
+@router.put("/replies/{comment_id}")
+async def admin_update_comment(
+    comment_id: int,
+    body: dict,
+    service: CommentService = Depends(get_comment_service),
+    current_user: User = Depends(require_permission("community", "update")),
+) -> Any:
+    content = body.get("contentMarkdown", body.get("content_markdown", ""))
+    comment = await service.update_comment(current_user.id, True, comment_id, content)
+    return {"id": comment.id, "content_markdown": comment.content_markdown}
+
+
+@router.delete("/replies/{comment_id}")
+async def admin_hard_delete_comment(
+    comment_id: int,
+    service: CommentService = Depends(get_comment_service),
+    current_user: User = Depends(require_permission("community", "delete")),
+) -> Any:
+    await service.hard_delete_comment(current_user.id, comment_id)
+    return {"ok": True}
+
+
+@router.post("/replies/{comment_id}/hide")
+async def hide_comment(
+    comment_id: int,
+    body: Optional[dict] = None,
+    service: CommentService = Depends(get_comment_service),
+    current_user: User = Depends(require_permission("community", "hide")),
+) -> Any:
+    reason = (body or {}).get("reason")
+    await service.hide_comment(current_user.id, comment_id, reason)
+    return {"ok": True}
+
+
+@router.post("/replies/{comment_id}/restore")
+async def restore_comment(
+    comment_id: int,
+    service: CommentService = Depends(get_comment_service),
+    current_user: User = Depends(require_permission("community", "restore")),
+) -> Any:
+    await service.restore_comment(current_user.id, comment_id)
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ 分类管理
+
+
+@router.get("/categories")
+async def admin_list_categories(
+    service: CategoryService = Depends(get_category_service),
+    current_user: User = Depends(require_permission("community", "read")),
+) -> Any:
+    return await service.list_categories()
+
+
+@router.post("/categories", response_model=dict, status_code=201)
+async def create_category(
+    body: dict,
+    service: CategoryService = Depends(get_category_service),
+    current_user: User = Depends(require_permission("community", "category_create")),
+) -> Any:
+    return await service.create_category(
+        current_user.id,
+        body.get("slug", ""),
+        body.get("name", ""),
+        body.get("description"),
+        body.get("icon"),
+        body.get("sort_order", 0),
+    )
+
+
+@router.put("/categories/{category_id}", response_model=dict)
+async def update_category(
+    category_id: int,
+    body: dict,
+    service: CategoryService = Depends(get_category_service),
+    current_user: User = Depends(require_permission("community", "category_update")),
+) -> Any:
+    return await service.update_category(
+        current_user.id,
+        category_id,
+        body.get("slug", ""),
+        body.get("name", ""),
+        body.get("description"),
+        body.get("icon"),
+        body.get("sort_order", 0),
+    )
+
+
+@router.delete("/categories/{category_id}")
+async def delete_category(
+    category_id: int,
+    service: CategoryService = Depends(get_category_service),
+    current_user: User = Depends(require_permission("community", "category_delete")),
+) -> Any:
+    await service.delete_category(current_user.id, category_id)
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ 举报处理
+
+
+@router.get("/reports")
+async def list_reports(
+    status: Optional[str] = None,
+    pagination: PaginationParams = Depends(),
+    service: ReportService = Depends(get_report_service),
+    current_user: User = Depends(require_permission("community", "read")),
+) -> Any:
+    reports, total = await service.list_reports(
+        status=status, skip=pagination.skip, limit=pagination.limit
+    )
+    return PaginatedResponse(
+        items=[
+            {
+                "id": r.id,
+                "reporter_id": r.reporter_id,
+                "target_type": r.target_type,
+                "target_id": r.target_id,
+                "reason": r.reason,
+                "detail": r.detail,
+                "status": r.status,
+                "handled_by": r.handled_by,
+                "handled_at": r.handled_at,
+                "created_at": r.created_at,
+            }
+            for r in reports
+        ],
+        total=total,
+        skip=pagination.skip,
+        limit=pagination.limit,
+    )
+
+
+@router.post("/reports/{report_id}/resolve")
+async def resolve_report(
+    report_id: int,
+    service: ReportService = Depends(get_report_service),
+    current_user: User = Depends(require_permission("community", "read")),
+) -> Any:
+    await service.resolve_report(current_user.id, report_id, "resolved")
+    return {"ok": True}
+
+
+@router.post("/reports/{report_id}/dismiss")
+async def dismiss_report(
+    report_id: int,
+    service: ReportService = Depends(get_report_service),
+    current_user: User = Depends(require_permission("community", "read")),
+) -> Any:
+    await service.resolve_report(current_user.id, report_id, "dismissed")
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ 社区管理
+
+
+@router.post("/community")
+async def admin_community_action(
+    request: Request,
+    service: PostService = Depends(get_post_service),
+    current_user: User = Depends(require_permission("community", "update")),
+) -> Any:
+    """社区管理操作：{sub: publish|archive|delete, post_id}。"""
+    body = await request.json()
+    sub = body.get("sub")
+    post_id = body.get("post_id")
+    if not post_id:
+        return {"error": "缺少 post_id"}
+    if sub == "publish":
+        return {
+            "post": post_to_dict(
+                await service.publish_post(current_user.id, int(post_id))
+            )
+        }
+    if sub == "archive":
+        return {
+            "post": post_to_dict(
+                await service.archive_post(current_user.id, int(post_id))
+            )
+        }
+    if sub == "delete":
+        await service.delete_post(current_user.id, int(post_id), is_admin=True)
+        return {"ok": True}
+    return {"error": "未知操作"}

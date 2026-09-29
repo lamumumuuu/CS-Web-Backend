@@ -1,0 +1,49 @@
+import re
+from typing import Optional
+
+MAX_PASSWORD_BYTES = 72
+MAX_EMAIL_LENGTH = 100
+
+
+def validate_password_strength(password: str) -> tuple[bool, Optional[str]]:
+    """
+    验证密码强度
+    返回 (is_valid, error_message)
+    """
+    if len(password) < 8:
+        return False, "密码长度至少为8个字符"
+
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        return False, f"密码 UTF-8 编码后不能超过{MAX_PASSWORD_BYTES}字节"
+
+    # 检查是否包含至少一个数字
+    if not re.search(r"\d", password):
+        return False, "密码必须包含至少一个数字"
+
+    # 检查是否包含至少一个字母
+    if not re.search(r"[a-zA-Z]", password):
+        return False, "密码必须包含至少一个字母"
+
+    # 检查是否包含至少一个特殊字符
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False, "密码必须包含至少一个特殊字符"
+
+    return True, None
+
+
+def validate_username(username: str) -> tuple[bool, Optional[str]]:
+    """
+    验证用户名
+    返回 (is_valid, error_message)
+    """
+    if len(username) < 3:
+        return False, "用户名长度至少为3个字符"
+
+    if len(username) > 50:
+        return False, "用户名长度不能超过50个字符"
+
+    # 只允许字母、数字、下划线和连字符
+    if not re.match(r"^[a-zA-Z0-9_-]+$", username):
+        return False, "用户名只能包含字母、数字、下划线和连字符"
+
+    return True, None

@@ -1,0 +1,166 @@
+"""access token 黑名单（可降级，与限流/缓存一致的高可用策略）。
+
+用途：登出、改密后让尚未过期的 access token 立即失效。
+- 未配置 Redis：纯进程内 TTL 字典（单实例可见）。
+- 配置了 Redis：跨实例一致；任意一次调用失败进入冷却期，期间按 fallback 兜底。
+- fallback="memory"（默认）：故障时回退内存（单进程保护）；Redis 恢复后仍回查内存，覆盖降级窗口。
+- fallback="open"：Redis 故障时放行（牺牲保护换可用性，不推荐）。
+- fallback="closed"：Redis 故障时拒绝所有 access token（高安全部署）。
+
+黑名单语义：key = access token 的 jti，value 占位。TTL = 该 access token 的剩余有效期，
+token 自然过期后条目自动清理，避免无限增长。
+"""
+
+import time
+from typing import Optional
+
+from app.core.config import settings
+from app.core.loguru_logger import get_logger
+from app.core.redis_client import get_redis_client
+
+logger = get_logger("token_blacklist")
+
+_REDIS_KEY_PREFIX = "jwt:blacklist:"
+
+# 内存黑名单容量上限：登出/改密产生的 jti 大多不会再被查询（惰性清理鞭长莫及），
+# 无上限会随时间无界增长。达到上限时先清过期项，仍超则淘汰最旧条目。
+_MEMORY_BLACKLIST_MAX_ENTRIES = 100_000
+
+
+class _MemoryBlacklist:
+    """进程内 TTL 黑名单（有界）。lazy 清理过期项 + 容量上限兜底，避免后台线程。"""
+
+    def __init__(self, max_entries: int = _MEMORY_BLACKLIST_MAX_ENTRIES) -> None:
+        self._store: dict[str, float] = {}  # jti -> expire_monotonic
+        self._max_entries = max_entries
+
+    def add(self, jti: str, ttl_seconds: int) -> None:
+        if ttl_seconds <= 0:
+            return
+        if len(self._store) >= self._max_entries and jti not in self._store:
+            self._evict_to_make_room()
+        self._store[jti] = time.monotonic() + ttl_seconds
+
+    def contains(self, jti: str) -> bool:
+        exp = self._store.get(jti)
+        if exp is None:
+            return False
+        if time.monotonic() >= exp:
+            # lazy 清理
+            self._store.pop(jti, None)
+            return False
+        return True
+
+    def _evict_to_make_room(self) -> None:
+        """先清全部过期项；仍满则按插入序淘汰最旧 10%（dict 保持插入序）。"""
+        now = time.monotonic()
+        expired = [k for k, exp in self._store.items() if now >= exp]
+        for k in expired:
+            del self._store[k]
+        if len(self._store) < self._max_entries:
+            return
+        evict_count = max(1, self._max_entries // 10)
+        for k in list(self._store)[:evict_count]:
+            del self._store[k]
+
+
+class TokenBlacklist:
+    def __init__(
+        self,
+        redis_client,
+        memory_backend: _MemoryBlacklist,
+        *,
+        fallback: str = "memory",
+        retry_interval: float = 5.0,
+    ) -> None:
+        self._redis = redis_client
+        self._memory = memory_backend
+        self._fallback = fallback
+        self._retry_interval = retry_interval
+        self._healthy = redis_client is not None
+        self._next_retry = 0.0
+
+    @property
+    def using_redis(self) -> bool:
+        return self._redis is not None and self._healthy
+
+    async def add(self, jti: str, ttl_seconds: int) -> None:
+        """把 jti 加入黑名单。写路径尽力而为，失败不抛（查询侧按 fallback 兜底）。"""
+        # ttl<=0 的边界（exp 已过/竞态算出 0）直接跳过：对 Redis 发 setex(key, 0)
+        # 会抛 ResponseError，把健康后端误标为故障进入冷却。
+        if ttl_seconds <= 0:
+            return
+        if self._redis is None:
+            self._memory.add(jti, ttl_seconds)
+            return
+        if not self._healthy and time.monotonic() < self._next_retry:
+            self._memory.add(jti, ttl_seconds)
+            return
+        try:
+            await self._redis.setex(f"{_REDIS_KEY_PREFIX}{jti}", ttl_seconds, "1")
+            self._mark_healthy()
+            # Redis 与内存双写：降级期间及 Redis 恢复之后，内存都能命中本进程的登出
+            self._memory.add(jti, ttl_seconds)
+        except Exception as e:  # noqa: BLE001 - 查询侧按 fallback 兜底
+            self._mark_unhealthy(e)
+            self._memory.add(jti, ttl_seconds)
+
+    async def contains(self, jti: str) -> bool:
+        """jti 是否在黑名单中。失败按 fallback 兜底。"""
+        if self._redis is None:
+            return self._fallback_contains(jti)
+        if not self._healthy and time.monotonic() < self._next_retry:
+            return self._fallback_contains(jti)
+        try:
+            hit = await self._redis.exists(f"{_REDIS_KEY_PREFIX}{jti}")
+            self._mark_healthy()
+            if bool(hit):
+                return True
+            # add() 所有路径都双写内存：恢复后回查内存，覆盖降级窗口内本进程拉黑的
+            # jti——否则故障期间的登出/改密保护会在 Redis 恢复瞬间失效（fail-open）。
+            # fallback="open" 例外：运维已选择可用性优先，保持只信 Redis。
+            return self._fallback != "open" and self._memory.contains(jti)
+        except Exception as e:  # noqa: BLE001
+            self._mark_unhealthy(e)
+            return self._fallback_contains(jti)
+
+    # ----------------------- 内部 -----------------------
+
+    def _mark_healthy(self) -> None:
+        if not self._healthy:
+            logger.info("Redis 黑名单后端已恢复，切回 Redis")
+            self._healthy = True
+
+    def _mark_unhealthy(self, error: Exception) -> None:
+        if self._healthy:
+            logger.warning(
+                "Redis 黑名单后端不可用，自动降级",
+                fallback=self._fallback,
+                retry_after=self._retry_interval,
+                error=str(error),
+            )
+        self._healthy = False
+        self._next_retry = time.monotonic() + self._retry_interval
+
+    def _fallback_contains(self, jti: str) -> bool:
+        if self._fallback == "closed":
+            return True
+        if self._fallback == "open":
+            return False  # 放行：Redis 故障时不视为黑名单
+        return self._memory.contains(jti)
+
+
+_blacklist: Optional[TokenBlacklist] = None
+
+
+def get_blacklist() -> TokenBlacklist:
+    """全局黑名单单例。"""
+    global _blacklist
+    if _blacklist is None:
+        _blacklist = TokenBlacklist(
+            get_redis_client(),
+            _MemoryBlacklist(),
+            fallback=settings.TOKEN_BLACKLIST_FALLBACK,
+            retry_interval=settings.RATE_LIMIT_REDIS_RETRY_INTERVAL,
+        )
+    return _blacklist
